@@ -113,6 +113,26 @@ async function loadFFmpeg() {
 }
 
 function safeUnlink(name) { try { ffmpeg.FS('unlink', name); } catch(_) {} }
+
+async function runFFmpeg(...args) {
+  try {
+    await ffmpeg.run(...args);
+  } catch (error) {
+    // ffmpeg.wasm / Emscripten が正常終了 exit(0) を例外として投げる場合がある
+    if (
+      error &&
+      error.name === 'ExitStatus' &&
+      error.status === 0
+    ) {
+      console.warn('[ffmpeg exit(0) ignored]', error);
+      return;
+    }
+
+    // status 0 以外は本当のエラー
+    throw error;
+  }
+}
+
 function downloadData(data, mimeType, fileName) {
   const blob = new Blob([data.buffer], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -140,13 +160,13 @@ async function executeBatch(mode) {
 
       if (mode === 'combine_audio') {
         const out = `part_${i}.mp3`;
-        await ffmpeg.run('-ss', String(item.start), '-t', String(duration), '-i', inputName,
+        await runFFmpeg('-ss', String(item.start), '-t', String(duration), '-i', inputName,
           '-vn', '-acodec', 'libmp3lame', '-q:a', '2', out);
         partNames.push(out);
       } else {
         const out = `part_${i}.mp4`;
         // 結合安定性のため各パートをH.264/AAC MP4へ統一。copyより遅いが失敗しにくい。
-        await ffmpeg.run('-ss', String(item.start), '-t', String(duration), '-i', inputName,
+        await runFFmpeg('-ss', String(item.start), '-t', String(duration), '-i', inputName,
           '-map', '0:v:0?', '-map', '0:a:0?',
           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
           '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out);
@@ -178,7 +198,7 @@ async function executeBatch(mode) {
         ffmpeg.FS('writeFile', 'concat.txt', concatText);
     
         try {
-          await ffmpeg.run(
+          await runFFmpeg(
             '-f', 'concat',
             '-safe', '0',
             '-i', 'concat.txt',
