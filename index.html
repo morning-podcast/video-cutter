@@ -114,37 +114,16 @@ async function loadFFmpeg() {
 
 function safeUnlink(name) { try { ffmpeg.FS('unlink', name); } catch(_) {} }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 
 async function runFFmpeg(...args) {
-  // ffmpeg.wasm 0.11 は、直前のrun直後に次のrunを呼ぶと
-  // 内部状態がまだ running のまま残ることがあるため、少し待つ。
-  await sleep(300);
-
   try {
     await ffmpeg.run(...args);
-
-    // 正常終了後も内部状態の反映待ち
-    await sleep(300);
   } catch (error) {
-    // ffmpeg.wasm / Emscripten が正常終了 exit(0) を例外として投げる場合がある
-    if (
-      error &&
-      error.name === 'ExitStatus' &&
-      error.status === 0
-    ) {
+    // ffmpeg.wasm 0.11 が正常終了 exit(0) を例外として投げる場合の対策
+    if (error && error.name === 'ExitStatus' && error.status === 0) {
       console.warn('[ffmpeg exit(0) ignored]', error);
-
-      // ここが重要：
-      // exit(0) を無視してすぐ次へ行くと
-      // "ffmpeg.wasm can only run one command at a time" が出ることがある
-      await sleep(500);
       return;
     }
-
     throw error;
   }
 }
@@ -159,89 +138,229 @@ function downloadData(data, mimeType, fileName) {
 
 async function executeBatch(mode) {
   const file = videoInput.files[0];
-  if (!file) return alert('動画を選択してください。');
-  if (cutList.length === 0) return alert('リストにカット範囲を追加してください。');
+
+  if (!file) {
+    return alert('動画を選択してください。');
+  }
+
+  if (cutList.length === 0) {
+    return alert('リストにカット範囲を追加してください。');
+  }
 
   document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+
   try {
     await loadFFmpeg();
-    const inputName = 'input_' + Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+
+    const inputName =
+      'input_' +
+      Date.now() +
+      '_' +
+      file.name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+
+    statusDiv.innerText = '⏳ 動画ファイルを読み込み中...';
     ffmpeg.FS('writeFile', inputName, await fetchFile(file));
 
-    const partNames = [];
-    for (let i = 0; i < cutList.length; i++) {
-      const item = cutList[i];
-      const duration = item.end - item.start;
-      statusDiv.innerText = `⏳ ${i+1}/${cutList.length} をカット中...`;
+    // =====================================================
+    // 1. 音声を1本のMP3に統合
+    //    複数範囲でも ffmpeg.run は1回だけ
+    // =====================================================
+    if (mode === 'combine_audio') {
+      const outputName = 'combined_audio.mp3';
 
-      if (mode === 'combine_audio') {
-        const out = `part_${i}.mp3`;
-        await runFFmpeg('-ss', String(item.start), '-t', String(duration), '-i', inputName,
-          '-vn', '-acodec', 'libmp3lame', '-q:a', '2', out);
-        partNames.push(out);
+      if (cutList.length === 1) {
+        const item = cutList[0];
+        const duration = item.end - item.start;
+
+        statusDiv.innerText = '⏳ 音声を抽出中...';
+
+        await runFFmpeg(
+          '-ss', String(item.start),
+          '-t', String(duration),
+          '-i', inputName,
+          '-vn',
+          '-acodec', 'libmp3lame',
+          '-q:a', '2',
+          outputName
+        );
       } else {
-        const out = `part_${i}.mp4`;
-        // 結合安定性のため各パートをH.264/AAC MP4へ統一。copyより遅いが失敗しにくい。
-        await runFFmpeg('-ss', String(item.start), '-t', String(duration), '-i', inputName,
-          '-map', '0:v:0?', '-map', '0:a:0?',
-          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-          '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out);
-        partNames.push(out);
+        statusDiv.innerText = '⏳ 複数範囲の音声を1回の処理で結合中...';
 
-        if (mode === 'separate_video') {
-          const data = ffmpeg.FS('readFile', out);
-          downloadData(data, 'video/mp4', `cut_${i+1}.mp4`);
-          await new Promise(r => setTimeout(r, 500));
-        }
+        const filterParts = [];
+        const concatInputs = [];
+
+        cutList.forEach((item, i) => {
+          filterParts.push(
+            `[0:a]atrim=start=${item.start}:end=${item.end},asetpts=PTS-STARTPTS[a${i}]`
+          );
+          concatInputs.push(`[a${i}]`);
+        });
+
+        const filterComplex =
+          filterParts.join(';') +
+          ';' +
+          concatInputs.join('') +
+          `concat=n=${cutList.length}:v=0:a=1[aout]`;
+
+        console.log('[audio filter_complex]', filterComplex);
+
+        await runFFmpeg(
+          '-i', inputName,
+          '-filter_complex', filterComplex,
+          '-map', '[aout]',
+          '-acodec', 'libmp3lame',
+          '-q:a', '2',
+          outputName
+        );
       }
+
+      const data = ffmpeg.FS('readFile', outputName);
+      downloadData(data, 'audio/mpeg', outputName);
+
+      safeUnlink(outputName);
+      safeUnlink(inputName);
+
+      statusDiv.innerText = '✅ 完了！MP3を保存しました。';
+      return;
     }
 
-    if (mode === 'combine_video' || mode === 'combine_audio') {
-        const finalName = mode === 'combine_audio' ? 'combined_audio.mp3' : 'combined_video.mp4';
-        const mimeType = mode === 'combine_audio' ? 'audio/mpeg' : 'video/mp4';
+    // =====================================================
+    // 2. 動画を1本のMP4に統合
+    //    複数範囲でも ffmpeg.run は1回だけ
+    // =====================================================
+    if (mode === 'combine_video') {
+      const outputName = 'combined_video.mp4';
 
-        // 1区間だけなら結合せず、そのまま保存する
-        if (partNames.length === 1) {
-            statusDiv.innerText = '⏳ 1区間のため結合せず、そのまま保存します...';
-            const data = ffmpeg.FS('readFile', partNames[0]);
-            downloadData(data, mimeType, finalName);
-        } else {
-            statusDiv.innerText = '⏳ 結合中...';
+      if (cutList.length === 1) {
+        const item = cutList[0];
+        const duration = item.end - item.start;
 
-            const concatText = partNames.map(n => `file '${n}'`).join('\n') + '\n';
-            console.log('[concat.txt]', concatText);
+        statusDiv.innerText = '⏳ 動画を書き出し中...';
 
-            ffmpeg.FS('writeFile', 'concat.txt', concatText);
+        await runFFmpeg(
+          '-ss', String(item.start),
+          '-t', String(duration),
+          '-i', inputName,
+          '-map', '0:v:0?',
+          '-map', '0:a:0?',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '160k',
+          '-movflags', '+faststart',
+          outputName
+        );
+      } else {
+        statusDiv.innerText = '⏳ 複数範囲の動画を1回の処理で結合中...';
 
-            try {
-                await runFFmpeg(
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', 'concat.txt',
-                    '-c', 'copy',
-                    finalName
-                );
-            } catch (concatError) {
-                console.error('[concat failed]', concatError);
-                throw new Error(
-                    '結合処理で失敗しました。Console の [concat failed] と fferr を確認してください。'
-                );
-            }
+        const filterParts = [];
+        const concatInputs = [];
 
-            const data = ffmpeg.FS('readFile', finalName);
-            downloadData(data, mimeType, finalName);
+        cutList.forEach((item, i) => {
+          filterParts.push(
+            `[0:v]trim=start=${item.start}:end=${item.end},setpts=PTS-STARTPTS[v${i}]`
+          );
+          filterParts.push(
+            `[0:a]atrim=start=${item.start}:end=${item.end},asetpts=PTS-STARTPTS[a${i}]`
+          );
 
-            safeUnlink(finalName);
-            safeUnlink('concat.txt');
-        }
+          concatInputs.push(`[v${i}][a${i}]`);
+        });
+
+        const filterComplex =
+          filterParts.join(';') +
+          ';' +
+          concatInputs.join('') +
+          `concat=n=${cutList.length}:v=1:a=1[vout][aout]`;
+
+        console.log('[video filter_complex]', filterComplex);
+
+        await runFFmpeg(
+          '-i', inputName,
+          '-filter_complex', filterComplex,
+          '-map', '[vout]',
+          '-map', '[aout]',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '160k',
+          '-movflags', '+faststart',
+          outputName
+        );
+      }
+
+      const data = ffmpeg.FS('readFile', outputName);
+      downloadData(data, 'video/mp4', outputName);
+
+      safeUnlink(outputName);
+      safeUnlink(inputName);
+
+      statusDiv.innerText = '✅ 完了！MP4を保存しました。';
+      return;
     }
 
-    partNames.forEach(safeUnlink);
-    safeUnlink(inputName);
-    statusDiv.innerText = '✅ 完了！ダウンロードフォルダを確認してください。';
+    // =====================================================
+    // 3. 動画を別々のMP4として保存
+    //    これは範囲ごとに ffmpeg.run する
+    //    すでに動いているとのことなので既存方針を維持
+    // =====================================================
+    if (mode === 'separate_video') {
+      for (let i = 0; i < cutList.length; i++) {
+        const item = cutList[i];
+        const duration = item.end - item.start;
+        const outputName = `cut_${i + 1}.mp4`;
+
+        statusDiv.innerText =
+          `⏳ ${i + 1}/${cutList.length} 個目の動画を書き出し中...`;
+
+        await runFFmpeg(
+          '-ss', String(item.start),
+          '-t', String(duration),
+          '-i', inputName,
+          '-map', '0:v:0?',
+          '-map', '0:a:0?',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '160k',
+          '-movflags', '+faststart',
+          outputName
+        );
+
+        const data = ffmpeg.FS('readFile', outputName);
+        downloadData(data, 'video/mp4', outputName);
+
+        safeUnlink(outputName);
+
+        // 連続ダウンロード時にブラウザが取りこぼさないよう少し待つ
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      safeUnlink(inputName);
+
+      statusDiv.innerText = '✅ 完了！個別MP4を保存しました。';
+      return;
+    }
+
+    throw new Error('不明な処理モードです: ' + mode);
+
   } catch (error) {
-    console.error(error);
-    statusDiv.innerText = '❌ エラーが発生しました:\n' + (error.message || String(error));
+    console.error('[executeBatch failed]', error);
+    console.error('[stack]', error && error.stack);
+
+    statusDiv.innerText =
+      '❌ エラーが発生しました:\n' +
+      (
+        error && error.stack
+          ? error.stack
+          : error && error.message
+            ? error.message
+            : JSON.stringify(error, null, 2)
+      );
+
   } finally {
     document.querySelectorAll('.btn').forEach(b => b.disabled = false);
   }
