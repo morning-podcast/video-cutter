@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video cut & convert - ffmpeg.wasm 0.11 single-thread</title>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" crossorigin="anonymous"></script>
+<style>
+  body { font-family: sans-serif; padding: 20px; background-color: #f0f2f5; }
+  .container { max-width: 760px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+  video { width: 100%; background: black; border-radius: 5px; margin: 15px 0; }
+  .btn { padding: 8px 12px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; font-size: 14px; margin-right: 5px; margin-bottom: 5px; }
+  .btn-green { background-color: #4CAF50; color: white; }
+  .btn-red { background-color: #f44336; color: white; }
+  .btn-gray { background-color: #607D8B; color: white; }
+  .btn-blue { background-color: #2196F3; color: white; width: 100%; margin-top: 10px; padding: 12px; }
+  .btn-purple { background-color: #9C27B0; color: white; width: 100%; margin-top: 10px; padding: 12px; }
+  .btn-orange { background-color: #FF9800; color: white; width: 100%; margin-top: 10px; padding: 12px; }
+  .btn:disabled { background-color: #ccc; cursor: not-allowed; }
+  .list-box { border: 1px solid #ddd; padding: 10px; border-radius: 5px; background: #fafafa; margin-bottom: 15px; }
+  ul { margin: 0; padding-left: 20px; }
+  li { margin-bottom: 5px; }
+  .note { font-size: 14px; color: #444; background: #fff8e1; border-left: 4px solid #ffb300; padding: 10px; border-radius: 4px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>✂️ 動画カッター ＆ MP3変換</h2>
+  <p class="note">
+    この版は <b>@ffmpeg/ffmpeg 0.11.6 + single-thread core</b> を使います。0.12系の <code>814.ffmpeg.js</code> Worker問題を避けるための実装です。<br>
+    Netlify の <code>_headers</code> は不要です。既存の <code>Cross-Origin-Embedder-Policy: require-corp</code> は削除してください。
+  </p>
+
+  <label><b>1. 動画を選択</b></label><br>
+  <input type="file" id="videoInput" accept="video/*,audio/*">
+  <video id="videoPlayer" controls></video>
+
+  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;">
+    <div><button class="btn btn-green" onclick="setStartTime()">🟢 ここから</button><input type="text" id="start_val" value="0" size="6"> 秒</div>
+    <div><button class="btn btn-red" onclick="setEndTime()">🔴 ここまで</button><input type="text" id="end_val" value="0" size="6"> 秒</div>
+    <button class="btn btn-gray" onclick="addToList()" style="padding: 10px 20px;">➕ リストに追加</button>
+  </div>
+
+  <div class="list-box">
+    <b>📝 リスト</b> <button onclick="clearList()" style="float: right; cursor: pointer;">🗑️ リストを空にする</button>
+    <ul id="cutListView"><li>まだ追加されていません</li></ul>
+  </div>
+
+  <hr style="margin: 20px 0;">
+  <label><b>2. 実行</b></label><br>
+  <button class="btn btn-blue" id="btnCombineVid" onclick="executeBatch('combine_video')">🎞️ リストの動画を1本のMP4に繋げて保存</button>
+  <button class="btn btn-purple" id="btnCombineAud" onclick="executeBatch('combine_audio')">🎵 リストの音声を1本のMP3に繋げて保存</button>
+  <button class="btn btn-orange" id="btnSeparateVid" onclick="executeBatch('separate_video')">🎬 リストの動画を別々のMP4として保存</button>
+
+  <p id="status" style="color: #d32f2f; font-weight: bold; margin-top: 15px; text-align: center; white-space: pre-wrap;"></p>
+</div>
+
+<script>
+const videoInput = document.getElementById('videoInput');
+const videoPlayer = document.getElementById('videoPlayer');
+const startVal = document.getElementById('start_val');
+const endVal = document.getElementById('end_val');
+const statusDiv = document.getElementById('status');
+const cutListView = document.getElementById('cutListView');
+let cutList = [];
+let isLoaded = false;
+let ffmpeg = null;
+
+const { createFFmpeg, fetchFile } = FFmpeg;
+
+videoInput.addEventListener('change', function(event) {
+  const file = event.target.files[0];
+  if (file) videoPlayer.src = URL.createObjectURL(file);
+});
+
+function setStartTime() { startVal.value = videoPlayer.currentTime.toFixed(3); }
+function setEndTime() { endVal.value = videoPlayer.currentTime.toFixed(3); }
+function addToList() {
+  const s = parseFloat(startVal.value);
+  const e = parseFloat(endVal.value);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return alert('数値を入力してください。');
+  if (e <= s) return alert('終了時間は開始時間より後にしてください。');
+  cutList.push({ start: s, end: e });
+  updateListView();
+}
+function clearList() { cutList = []; updateListView(); }
+function updateListView() {
+  if (cutList.length === 0) { cutListView.innerHTML = '<li>まだ追加されていません</li>'; return; }
+  cutListView.innerHTML = '';
+  cutList.forEach((item, index) => {
+    const li = document.createElement('li');
+    li.innerText = `[${index + 1}] ${item.start} 秒 ～ ${item.end} 秒`;
+    cutListView.appendChild(li);
+  });
+}
+
+async function loadFFmpeg() {
+  if (isLoaded) return;
+  statusDiv.innerText = '⏳ ffmpeg.wasm を読み込み中... 初回は時間がかかります';
+
+  // 0.12系の 814.ffmpeg.js 問題を避けるため、0.11.6 API + single-thread core を使用。
+  // single-thread core は SharedArrayBuffer/COOP/COEP 依存を避ける目的で mainName: 'main' を指定。
+  ffmpeg = createFFmpeg({
+    log: true,
+    mainName: 'main',
+    corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js',
+    progress: ({ ratio }) => {
+      if (ratio && ratio > 0) statusDiv.innerText = `⏳ 処理中... ${Math.min(100, Math.round(ratio * 100))}%`;
+    }
+  });
+  await ffmpeg.load();
+  isLoaded = true;
+}
+
+function safeUnlink(name) { try { ffmpeg.FS('unlink', name); } catch(_) {} }
+function downloadData(data, mimeType, fileName) {
+  const blob = new Blob([data.buffer], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = fileName; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function executeBatch(mode) {
+  const file = videoInput.files[0];
+  if (!file) return alert('動画を選択してください。');
+  if (cutList.length === 0) return alert('リストにカット範囲を追加してください。');
+
+  document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+  try {
+    await loadFFmpeg();
+    const inputName = 'input_' + Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+    ffmpeg.FS('writeFile', inputName, await fetchFile(file));
+
+    const partNames = [];
+    for (let i = 0; i < cutList.length; i++) {
+      const item = cutList[i];
+      const duration = item.end - item.start;
+      statusDiv.innerText = `⏳ ${i+1}/${cutList.length} をカット中...`;
+
+      if (mode === 'combine_audio') {
+        const out = `part_${i}.mp3`;
+        await ffmpeg.run('-ss', String(item.start), '-t', String(duration), '-i', inputName,
+          '-vn', '-acodec', 'libmp3lame', '-q:a', '2', out);
+        partNames.push(out);
+      } else {
+        const out = `part_${i}.mp4`;
+        // 結合安定性のため各パートをH.264/AAC MP4へ統一。copyより遅いが失敗しにくい。
+        await ffmpeg.run('-ss', String(item.start), '-t', String(duration), '-i', inputName,
+          '-map', '0:v:0?', '-map', '0:a:0?',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+          '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out);
+        partNames.push(out);
+
+        if (mode === 'separate_video') {
+          const data = ffmpeg.FS('readFile', out);
+          downloadData(data, 'video/mp4', `cut_${i+1}.mp4`);
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    }
+
+    if (mode === 'combine_video' || mode === 'combine_audio') {
+      statusDiv.innerText = '⏳ 結合中...';
+      const concatText = partNames.map(n => `file '${n}'`).join('\n') + '\n';
+      ffmpeg.FS('writeFile', 'concat.txt', concatText);
+      const finalName = mode === 'combine_audio' ? 'combined_audio.mp3' : 'combined_video.mp4';
+      await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', finalName);
+      const data = ffmpeg.FS('readFile', finalName);
+      downloadData(data, mode === 'combine_audio' ? 'audio/mpeg' : 'video/mp4', finalName);
+      safeUnlink(finalName); safeUnlink('concat.txt');
+    }
+
+    partNames.forEach(safeUnlink);
+    safeUnlink(inputName);
+    statusDiv.innerText = '✅ 完了！ダウンロードフォルダを確認してください。';
+  } catch (error) {
+    console.error(error);
+    statusDiv.innerText = '❌ エラーが発生しました:\n' + (error.message || String(error));
+  } finally {
+    document.querySelectorAll('.btn').forEach(b => b.disabled = false);
+  }
+}
+</script>
+</body>
+</html>
