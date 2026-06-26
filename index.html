@@ -161,14 +161,43 @@ async function executeBatch(mode) {
     }
 
     if (mode === 'combine_video' || mode === 'combine_audio') {
-      statusDiv.innerText = '⏳ 結合中...';
-      const concatText = partNames.map(n => `file '${n}'`).join('\n') + '\n';
-      ffmpeg.FS('writeFile', 'concat.txt', concatText);
       const finalName = mode === 'combine_audio' ? 'combined_audio.mp3' : 'combined_video.mp4';
-      await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', finalName);
-      const data = ffmpeg.FS('readFile', finalName);
-      downloadData(data, mode === 'combine_audio' ? 'audio/mpeg' : 'video/mp4', finalName);
-      safeUnlink(finalName); safeUnlink('concat.txt');
+      const mimeType = mode === 'combine_audio' ? 'audio/mpeg' : 'video/mp4';
+    
+      // 1区間だけなら結合せず、そのまま保存する
+      if (partNames.length === 1) {
+        statusDiv.innerText = '⏳ 1区間のため結合せず、そのまま保存します...';
+        const data = ffmpeg.FS('readFile', partNames[0]);
+        downloadData(data, mimeType, finalName);
+      } else {
+        statusDiv.innerText = '⏳ 結合中...';
+    
+        const concatText = partNames.map(n => `file '${n}'`).join('\n') + '\n';
+        console.log('[concat.txt]', concatText);
+    
+        ffmpeg.FS('writeFile', 'concat.txt', concatText);
+    
+        try {
+          await ffmpeg.run(
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', 'concat.txt',
+            '-c', 'copy',
+            finalName
+          );
+        } catch (concatError) {
+          console.error('[concat failed]', concatError);
+          throw new Error(
+            '結合処理で失敗しました。Console の [concat failed] と fferr を確認してください。'
+          );
+        }
+    
+        const data = ffmpeg.FS('readFile', finalName);
+        downloadData(data, mimeType, finalName);
+    
+        safeUnlink(finalName);
+        safeUnlink('concat.txt');
+      }
     }
 
     partNames.forEach(safeUnlink);
