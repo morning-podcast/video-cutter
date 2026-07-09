@@ -101,15 +101,6 @@
     margin-bottom: 5px;
   }
 
-  .note {
-    font-size: 14px;
-    color: #444;
-    background: #fff8e1;
-    border-left: 4px solid #ffb300;
-    padding: 10px;
-    border-radius: 4px;
-    line-height: 1.6;
-  }
 </style>
 </head>
 
@@ -117,39 +108,37 @@
 <div class="container">
   <h2>✂️ 動画カッター ＆ MP3変換</h2>
 
-  <p class="note">
-    この版は <b>@ffmpeg/ffmpeg 0.11.6 + single-thread core</b> を使います。<br>
-    GitHub Pages で動かす場合、Netlify 用の <code>_headers</code> は不要です。
-  </p>
 
   <label><b>1. 動画を選択</b></label><br>
   <input type="file" id="videoInput" accept="video/*,audio/*">
 
   <video id="videoPlayer" controls></video>
 
-  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;">
-    <div>
-      <button class="btn btn-green" onclick="setStartTime()">🟢 ここから</button>
+  <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 10px; flex-wrap: wrap;">
+    <div style="display: flex; align-items: center; gap: 5px;">
+      <button class="btn btn-green" onclick="setStartTime()" style="margin: 0;">🟢 ここから</button>
       <input type="text" id="start_val" value="0" size="6"> 秒
+      <button class="btn btn-gray" onclick="jumpTo(startVal.value)" style="margin: 0; padding: 4px 8px; font-size: 12px;">⏬ ジャンプ</button>
     </div>
 
-    <div>
-      <button class="btn btn-red" onclick="setEndTime()">🔴 ここまで</button>
+    <div style="display: flex; align-items: center; gap: 5px;">
+      <button class="btn btn-red" onclick="setEndTime()" style="margin: 0;">🔴 ここまで</button>
       <input type="text" id="end_val" value="0" size="6"> 秒
+      <button class="btn btn-gray" onclick="jumpTo(endVal.value)" style="margin: 0; padding: 4px 8px; font-size: 12px;">⏬ ジャンプ</button>
     </div>
 
-    <button class="btn btn-gray" onclick="addToList()" style="padding: 10px 20px;">
+    <button class="btn btn-gray" onclick="addToList()" style="margin: 0; padding: 10px 20px;">
       ➕ リストに追加
     </button>
   </div>
 
   <div class="list-box">
     <b>📝 リスト</b>
-    <button onclick="clearList()" style="float: right; cursor: pointer;">
-      🗑️ リストを空にする
+    <button onclick="clearList()" style="float: right; cursor: pointer; padding: 2px 6px;">
+      🗑️ 全て空にする
     </button>
-    <ul id="cutListView">
-      <li>まだ追加されていません</li>
+    <ul id="cutListView" style="padding-left: 0; margin-top: 10px;">
+      <li style="list-style: none;">まだ追加されていません</li>
     </ul>
   </div>
 
@@ -201,6 +190,32 @@ function setEndTime() {
   endVal.value = videoPlayer.currentTime.toFixed(3);
 }
 
+
+function jumpTo(val) {
+  const time = parseFloat(val);
+  if (Number.isFinite(time)) {
+    videoPlayer.currentTime = time;
+  }
+}
+
+
+document.addEventListener('keydown', function(event) {
+  // テキスト入力欄にフォーカスがある場合は無効化
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
+    return;
+  }
+  
+  if (event.key === 'ArrowLeft') {
+    videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime - 5);
+    event.preventDefault(); // 画面の横スクロールなどを防ぐ
+  } else if (event.key === 'ArrowRight') {
+    if (videoPlayer.duration) {
+      videoPlayer.currentTime = Math.min(videoPlayer.duration, videoPlayer.currentTime + 5);
+    }
+    event.preventDefault();
+  }
+});
+
 function addToList() {
   const s = parseFloat(startVal.value);
   const e = parseFloat(endVal.value);
@@ -224,7 +239,7 @@ function clearList() {
 
 function updateListView() {
   if (cutList.length === 0) {
-    cutListView.innerHTML = '<li>まだ追加されていません</li>';
+    cutListView.innerHTML = '<li style="list-style: none;">まだ追加されていません</li>';
     return;
   }
 
@@ -232,7 +247,32 @@ function updateListView() {
 
   cutList.forEach((item, index) => {
     const li = document.createElement('li');
-    li.innerText = `[${index + 1}] ${item.start} 秒 ～ ${item.end} 秒`;
+    li.style.display = 'flex';
+    li.style.justifyContent = 'space-between';
+    li.style.alignItems = 'center';
+    li.style.padding = '5px';
+    li.style.borderBottom = '1px dashed #ccc';
+    li.style.listStyle = 'none';
+
+    const textSpan = document.createElement('span');
+    textSpan.innerText = `[${index + 1}] ${item.start} 秒 ～ ${item.end} 秒`;
+
+    
+    const delBtn = document.createElement('button');
+    delBtn.innerText = '❌ 削除';
+    delBtn.style.cursor = 'pointer';
+    delBtn.style.border = '1px solid #ccc';
+    delBtn.style.background = '#fff';
+    delBtn.style.borderRadius = '3px';
+    delBtn.style.padding = '2px 6px';
+    delBtn.style.fontSize = '12px';
+    delBtn.onclick = () => {
+      cutList.splice(index, 1); // 該当するインデックスを配列から削除
+      updateListView();         // リストを再描画
+    };
+
+    li.appendChild(textSpan);
+    li.appendChild(delBtn);
     cutListView.appendChild(li);
   });
 }
